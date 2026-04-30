@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import asyncio
+import contextlib
 import json
 import subprocess
 import sys
@@ -19,7 +20,7 @@ import os
 import tempfile
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog
 
 import numpy as np
 import sounddevice as sd
@@ -45,6 +46,19 @@ SPEED_LABELS = ["0.5x", "0.6x", "0.7x", "0.8x", "0.9x", "1.0x",
 DEFAULT_SPEED = 6  # 1.1x
 
 REWIND_SEC = 10
+
+# Quality presets: (display label, edge-tts format string, sample rate)
+# The format string is monkey-patched into edge-tts at synthesis time because
+# edge-tts v7.x hardcodes the output format internally. This is fragile; if
+# the patch fails the app falls back to Standard quality automatically.
+QUALITY_PRESETS = [
+    ("Standard",  "audio-24khz-48kbitrate-mono-mp3", 24_000),
+    ("High",      "audio-24khz-96kbitrate-mono-mp3", 24_000),
+    ("Studio",    "audio-48khz-96kbitrate-mono-mp3", 48_000),
+]
+QUALITY_LABELS      = [q[0] for q in QUALITY_PRESETS]
+DEFAULT_QUALITY_IDX = 0
+_TTS_DEFAULT_FORMAT = "audio-24khz-48kbitrate-mono-mp3"
 
 C = dict(
     base="#1e1e2e", mantle="#181825", surface="#313244", overlay="#45475a",
@@ -72,9 +86,45 @@ def _save_prefs(data: dict):
         pass
 
 
+# ── Quality monkey-patch ────────────────────────────────────────────────────
+
+@contextlib.contextmanager
+def _patch_tts_format(fmt: str):
+    """Temporarily override the edge-tts output format by patching aiohttp's
+    ClientSession to use a custom WebSocket response class that rewrites the
+    speech.config message on the wire. Falls back to Standard if patching fails."""
+    if fmt == _TTS_DEFAULT_FORMAT:
+        yield
+        return
+    try:
+        import aiohttp
+
+        class _PatchedWS(aiohttp.ClientWebSocketResponse):
+            async def send_str(self, data: str, compress=None) -> None:
+                data = data.replace(
+                    f'"outputFormat":"{_TTS_DEFAULT_FORMAT}"',
+                    f'"outputFormat":"{fmt}"',
+                )
+                return await super().send_str(data, compress=compress)
+
+        _orig_init = aiohttp.ClientSession.__init__
+
+        def _patched_init(self_s, *args, **kwargs):
+            kwargs.setdefault("ws_response_class", _PatchedWS)
+            _orig_init(self_s, *args, **kwargs)
+
+        aiohttp.ClientSession.__init__ = _patched_init
+        try:
+            yield
+        finally:
+            aiohttp.ClientSession.__init__ = _orig_init
+    except Exception:
+        yield  # silently fall back to default format
+
+
 # ── WSOLA time-stretch ───────────────────────────────────────────────────────
 
-def _wsola(audio: np.ndarray, speed: float) -> np.ndarray:
+def _wsola(audio: np.ndarray, speed: float, sr: int = 24_000) -> np.ndarray:
     """
     Waveform Similarity Overlap-Add.
     Changes playback speed while preserving pitch.
@@ -87,12 +137,12 @@ def _wsola(audio: np.ndarray, speed: float) -> np.ndarray:
     if abs(speed - 1.0) < 0.01:
         return audio.copy()
 
-    win     = 1024              # ~43 ms at 24 kHz
+    win     = max(1024, int(sr * 0.043))   # ~43 ms; scales with sample rate
     if len(audio) < win:
         return audio.copy()
-    syn_hop = win // 2          # 50% overlap → Hann window sums to 1
+    syn_hop = win // 2                     # 50% overlap → Hann window sums to 1
     ana_hop = int(syn_hop * speed)
-    search  = 256               # ±256 samples — covers speech pitch periods
+    search  = max(256, int(sr * 0.011))    # ~11 ms search window
 
     # Precompute cumulative squared energy for O(1) per-candidate norm lookup
     sq_cum = np.zeros(len(audio) + 1, dtype=np.float64)
@@ -146,9 +196,8 @@ class AudioEngine:
     discards stale results when the user clicks fast.
     """
 
-    SR = 24_000
-
-    def __init__(self):
+    def __init__(self, sample_rate: int = 24_000):
+        self.sr = sample_rate
         self._original: np.ndarray | None = None
         self._active:   np.ndarray | None = None   # what the callback reads
         self._pos     = 0          # sample index in _active
@@ -195,10 +244,10 @@ class AudioEngine:
             path,
             output_format=miniaudio.SampleFormat.FLOAT32,
             nchannels=1,
-            sample_rate=self.SR,
+            sample_rate=self.sr,
         )
         self._original = np.frombuffer(decoded.samples, dtype=np.float32).copy()
-        self.duration  = len(self._original) / self.SR
+        self.duration  = len(self._original) / self.sr
         self._active   = self._original
         self._pos      = 0
         self._state    = "idle"
@@ -235,7 +284,7 @@ class AudioEngine:
     # -- Stream ----------------------------------------------------------------
     def _open_stream(self):
         self._stream = sd.OutputStream(
-            samplerate=self.SR, channels=1, dtype="float32",
+            samplerate=self.sr, channels=1, dtype="float32",
             callback=self._callback, finished_callback=self._finished,
         )
         self._stream.start()
@@ -263,11 +312,13 @@ class AudioEngine:
         spd = self._speed
         sec = start_sec
 
+        sr = self.sr
+
         def _worker():
             if abs(spd - 1.0) < 0.01:
                 stretched = self._original
             else:
-                stretched = _wsola(self._original, spd)
+                stretched = _wsola(self._original, spd, sr)
             with self._lock:
                 if gen != self._gen:
                     return  # superseded; bail before touching stream
@@ -334,12 +385,13 @@ class AudioEngine:
 
         self._speed = speed
         gen = self._bump_gen()
+        sr = self.sr
 
         def _worker():
             if abs(speed - 1.0) < 0.01:
                 stretched = self._original
             else:
-                stretched = _wsola(self._original, speed)
+                stretched = _wsola(self._original, speed, sr)
 
             with self._lock:
                 if gen != self._gen:
@@ -404,7 +456,7 @@ def get_clipboard_text() -> str:
     return _decode_bytes(result.stdout)
 
 
-def fetch_audio(text: str, voice: str) -> str:
+def fetch_audio(text: str, voice: str, audio_format: str = _TTS_DEFAULT_FORMAT) -> str:
     import edge_tts
     fd, path = tempfile.mkstemp(suffix=".mp3")
     os.close(fd)
@@ -417,7 +469,8 @@ def fetch_audio(text: str, voice: str) -> str:
                     if chunk["type"] == "audio":
                         f.write(chunk["data"])
 
-        loop.run_until_complete(_run())
+        with _patch_tts_format(audio_format):
+            loop.run_until_complete(_run())
     except Exception:
         try:
             os.unlink(path)
@@ -436,9 +489,11 @@ class TTSPlayer:
     def __init__(self, initial_text: str, voice_idx: int | None, speed_idx: int | None,
                  use_prefs: bool = True):
         prefs = _load_prefs() if use_prefs else {}
-        self.voice_idx  = voice_idx if voice_idx is not None else prefs.get("voice_idx", DEFAULT_VOICE_IDX)
-        self.speed_idx  = speed_idx if speed_idx is not None else prefs.get("speed_idx", DEFAULT_SPEED)
-        self.engine     = AudioEngine()
+        self.voice_idx   = voice_idx if voice_idx is not None else prefs.get("voice_idx", DEFAULT_VOICE_IDX)
+        self.speed_idx   = speed_idx if speed_idx is not None else prefs.get("speed_idx", DEFAULT_SPEED)
+        self.quality_idx = prefs.get("quality_idx", DEFAULT_QUALITY_IDX)
+        _sr = QUALITY_PRESETS[self.quality_idx][2]
+        self.engine      = AudioEngine(sample_rate=_sr)
         self.loading     = False
         self._fetch_gen  = 0
         self._tick_id    = None
@@ -493,7 +548,7 @@ class TTSPlayer:
         )
         self.pin_btn.grid(row=0, column=2, sticky="e")
 
-        # Row 1: Voice
+        # Row 1: Voice + Quality
         bar = tk.Frame(main, bg=C["base"])
         bar.grid(row=1, column=0, sticky="ew", pady=(0, 4))
         tk.Label(bar, text="Voice:", bg=C["base"], fg=C["subtext"],
@@ -505,6 +560,17 @@ class TTSPlayer:
         self.voice_cb.pack(side="left")
         self.voice_cb.current(self.voice_idx)
         self.voice_cb.bind("<<ComboboxSelected>>", self._on_voice_changed)
+        tk.Label(bar, text="Quality:", bg=C["base"], fg=C["subtext"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(10, 4))
+        self.quality_var = tk.StringVar(value=QUALITY_LABELS[self.quality_idx])
+        self.quality_cb = ttk.Combobox(bar, textvariable=self.quality_var,
+                                       values=QUALITY_LABELS,
+                                       state="readonly", width=10)
+        self.quality_cb.pack(side="left")
+        self.quality_cb.current(self.quality_idx)
+        self.quality_cb.bind("<<ComboboxSelected>>", self._on_quality_changed)
+        tk.Label(bar, text="(↑quality = ↑CPU)", bg=C["base"], fg=C["muted"],
+                 font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
 
         # Row 2: Text area
         txt_frame = tk.Frame(main, bg=C["surface"])
@@ -634,6 +700,17 @@ class TTSPlayer:
             self._resume_sec = self.engine.position if self.engine.is_playing or self.engine.is_paused else 0.0
             self._speak()
 
+    def _on_quality_changed(self, _=None):
+        idx = self.quality_cb.current()
+        if idx < 0:
+            return
+        self.quality_idx = idx
+        new_sr = QUALITY_PRESETS[idx][2]
+        if self.engine.is_idle and self.engine.duration == 0:
+            self.engine.sr = new_sr
+        elif not self.loading:
+            self.status_var.set(f"Quality → {QUALITY_LABELS[idx]}  (applies on next Speak)")
+
     def _on_text_changed(self, _=None):
         self.text_area.edit_modified(False)
         self._update_char_count()
@@ -691,10 +768,12 @@ class TTSPlayer:
         idx = self.voice_cb.current()
         voice_id = VOICES[idx][1] if idx >= 0 else VOICES[self.voice_idx][1]
         speed = SPEED_STEPS[self.speed_idx]
+        audio_fmt, new_sr = QUALITY_PRESETS[self.quality_idx][1], QUALITY_PRESETS[self.quality_idx][2]
+        self.engine.sr = new_sr  # update SR before WSOLA workers are spawned
 
         def _worker():
             try:
-                path = fetch_audio(text, voice_id)
+                path = fetch_audio(text, voice_id, audio_fmt)
                 if gen != self._fetch_gen:
                     try: os.unlink(path)
                     except OSError: pass
@@ -868,7 +947,8 @@ class TTSPlayer:
 
     # ── Close ─────────────────────────────────────────────────────────────────
     def _on_close(self):
-        _save_prefs({"speed_idx": self.speed_idx, "voice_idx": self.voice_idx})
+        _save_prefs({"speed_idx": self.speed_idx, "voice_idx": self.voice_idx,
+                     "quality_idx": self.quality_idx})
         self._cancel_tick()
         self.engine.on_done = None  # prevent callbacks on destroyed widget
         self.engine.stop()          # also increments _gen to cancel WSOLA threads
