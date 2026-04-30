@@ -60,7 +60,7 @@ def _load_prefs() -> dict:
     try:
         with open(_PREFS, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except (OSError, json.JSONDecodeError):
         return {}
 
 
@@ -68,7 +68,7 @@ def _save_prefs(data: dict):
     try:
         with open(_PREFS, "w", encoding="utf-8") as f:
             json.dump(data, f)
-    except Exception:
+    except OSError:
         pass
 
 
@@ -161,13 +161,24 @@ class AudioEngine:
         self.on_done: callable = None
         self.duration = 0.0
 
+    def _bump_gen(self) -> int:
+        with self._lock:
+            self._gen += 1
+            return self._gen
+
     # -- State -----------------------------------------------------------------
     @property
-    def is_playing(self) -> bool:  return self._state == "playing"
+    def is_playing(self) -> bool:
+        with self._lock:
+            return self._state == "playing"
     @property
-    def is_paused(self)  -> bool:  return self._state == "paused"
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._state == "paused"
     @property
-    def is_idle(self)    -> bool:  return self._state in ("idle", "done")
+    def is_idle(self) -> bool:
+        with self._lock:
+            return self._state in ("idle", "done")
 
     @property
     def position(self) -> float:
@@ -236,19 +247,19 @@ class AudioEngine:
             try:
                 s.stop()
                 s.close()
-            except Exception:
+            except sd.PortAudioError:
                 pass
 
     # -- Controls --------------------------------------------------------------
     def play(self, start_sec: float = 0.0, speed: float | None = None,
              on_ready: callable = None):
         """Start playback. WSOLA runs in a background thread to avoid UI freeze."""
-        self._state = "idle"
+        with self._lock:
+            self._state = "idle"
         self._close_stream()
         if speed is not None:
             self._speed = speed
-        self._gen += 1
-        gen = self._gen
+        gen = self._bump_gen()
         spd = self._speed
         sec = start_sec
 
@@ -257,18 +268,18 @@ class AudioEngine:
                 stretched = self._original
             else:
                 stretched = _wsola(self._original, spd)
-            if gen != self._gen:
-                return
             with self._lock:
+                if gen != self._gen:
+                    return  # superseded; bail before touching stream
                 self._active = stretched
                 self._pos = int((sec / max(self.duration, 1e-9)) * len(stretched))
-            self._state = "playing"
+                self._state = "playing"
             self._open_stream()
             if on_ready:
                 try:
                     on_ready()
-                except Exception:
-                    pass  # widget may have been destroyed
+                except tk.TclError:
+                    pass  # widget destroyed before callback fired
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -322,39 +333,40 @@ class AudioEngine:
             return
 
         self._speed = speed
-        self._gen += 1
-        gen = self._gen
+        gen = self._bump_gen()
 
         def _worker():
             if abs(speed - 1.0) < 0.01:
                 stretched = self._original
             else:
                 stretched = _wsola(self._original, speed)
-            if gen != self._gen:
-                return  # user changed speed again, discard
 
-            was_playing = self.is_playing
-            # Capture position NOW (not when button was clicked)
             with self._lock:
-                if self._active is not None and len(self._active) > 0:
-                    frac = self._pos / len(self._active)
-                else:
-                    frac = 0.0
+                if gen != self._gen:
+                    return  # superseded; bail before touching stream
+                was_playing = self._state == "playing"
+                frac = (self._pos / len(self._active)) if (self._active is not None and len(self._active) > 0) else 0.0
+                if was_playing:
+                    self._state = "idle"   # prevent _finished from firing
 
             if was_playing:
-                self._state = "idle"   # prevent _finished from firing
                 self._close_stream()
+
             with self._lock:
+                if gen != self._gen:
+                    return  # guard against a concurrent stop() between close and swap
                 self._active = stretched
                 self._pos = max(0, min(int(frac * len(stretched)), len(stretched) - 1))
+                if was_playing:
+                    self._state = "playing"
+
             if was_playing:
-                self._state = "playing"
                 self._open_stream()
             if on_ready:
                 try:
                     on_ready()
-                except Exception:
-                    pass  # widget may have been destroyed
+                except tk.TclError:
+                    pass  # widget destroyed before callback fired
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -362,8 +374,9 @@ class AudioEngine:
         self._volume = max(0.0, min(vol, 1.0))
 
     def stop(self):
-        self._state = "idle"
-        self._gen += 1          # cancel any pending WSOLA worker
+        with self._lock:
+            self._state = "idle"
+        self._bump_gen()        # cancel any pending WSOLA worker
         self._close_stream()
         with self._lock:
             self._pos = 0
@@ -684,7 +697,7 @@ class TTSPlayer:
                 path = fetch_audio(text, voice_id)
                 if gen != self._fetch_gen:
                     try: os.unlink(path)
-                    except Exception: pass
+                    except OSError: pass
                     return  # stale — a newer request is in flight
                 self.root.after(0, lambda: self._on_ready(path, speed, gen))
             except Exception as exc:
@@ -696,7 +709,7 @@ class TTSPlayer:
     def _on_ready(self, path: str, speed: float, gen: int = -1):
         if gen != -1 and gen != self._fetch_gen:
             try: os.unlink(path)
-            except Exception: pass
+            except OSError: pass
             return  # superseded by a newer request
         try:
             self.engine.load_file(path)
@@ -706,7 +719,7 @@ class TTSPlayer:
         finally:
             try:
                 os.unlink(path)
-            except Exception:
+            except OSError:
                 pass
 
         self.engine.set_volume(self.vol_var.get() / 100)
