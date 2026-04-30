@@ -88,6 +88,8 @@ def _wsola(audio: np.ndarray, speed: float) -> np.ndarray:
         return audio.copy()
 
     win     = 1024              # ~43 ms at 24 kHz
+    if len(audio) < win:
+        return audio.copy()
     syn_hop = win // 2          # 50% overlap → Hann window sums to 1
     ana_hop = int(syn_hop * speed)
     search  = 256               # ±256 samples — covers speech pitch periods
@@ -369,36 +371,48 @@ class AudioEngine:
 
 # ── TTS fetch ─────────────────────────────────────────────────────────────────
 
+def _decode_bytes(data: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-16", "cp1252"):
+        try:
+            text = data.decode(enc).strip()
+            if text:
+                return text
+        except (UnicodeDecodeError, ValueError):
+            continue
+    return data.decode("utf-8", errors="replace").strip()
+
+
 def get_clipboard_text() -> str:
     result = subprocess.run(
         ["powershell", "-NoProfile", "-Command",
          "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard"],
         capture_output=True,
     )
-    for enc in ("utf-8-sig", "utf-16", "cp1252"):
-        try:
-            text = result.stdout.decode(enc).strip()
-            if text:
-                return text
-        except (UnicodeDecodeError, ValueError):
-            continue
-    return result.stdout.decode("utf-8", errors="replace").strip()
+    return _decode_bytes(result.stdout)
 
 
 def fetch_audio(text: str, voice: str) -> str:
     import edge_tts
+    fd, path = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd)
     loop = asyncio.new_event_loop()
+    try:
+        async def _run():
+            comm = edge_tts.Communicate(text, voice, rate="+0%")
+            with open(path, "wb") as f:
+                async for chunk in comm.stream():
+                    if chunk["type"] == "audio":
+                        f.write(chunk["data"])
 
-    async def _run():
-        comm = edge_tts.Communicate(text, voice, rate="+0%")
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            async for chunk in comm.stream():
-                if chunk["type"] == "audio":
-                    f.write(chunk["data"])
-            return f.name
-
-    path = loop.run_until_complete(_run())
-    loop.close()
+        loop.run_until_complete(_run())
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    finally:
+        loop.close()
     return path
 
 
@@ -406,11 +420,11 @@ def fetch_audio(text: str, voice: str) -> str:
 
 class TTSPlayer:
 
-    def __init__(self, initial_text: str, voice_idx: int, speed_idx: int,
+    def __init__(self, initial_text: str, voice_idx: int | None, speed_idx: int | None,
                  use_prefs: bool = True):
         prefs = _load_prefs() if use_prefs else {}
-        self.voice_idx  = prefs.get("voice_idx", voice_idx)
-        self.speed_idx  = prefs.get("speed_idx", speed_idx)
+        self.voice_idx  = voice_idx if voice_idx is not None else prefs.get("voice_idx", DEFAULT_VOICE_IDX)
+        self.speed_idx  = speed_idx if speed_idx is not None else prefs.get("speed_idx", DEFAULT_SPEED)
         self.engine     = AudioEngine()
         self.loading     = False
         self._fetch_gen  = 0
@@ -862,21 +876,30 @@ def main():
     src.add_argument("--clipboard", action="store_true")
     src.add_argument("--text", type=str)
     src.add_argument("--file", type=str)
-    parser.add_argument("--voice", type=int, default=DEFAULT_VOICE_IDX)
-    parser.add_argument("--speed", type=int, default=DEFAULT_SPEED)
+    parser.add_argument("--voice", type=int, default=None)
+    parser.add_argument("--speed", type=int, default=None)
     args = parser.parse_args()
 
+    empty_clipboard = False
     if args.text:
         text = args.text
     elif args.file:
-        with open(args.file, "r", encoding="utf-8") as f:
-            text = f.read().strip()
+        try:
+            with open(args.file, "rb") as f:
+                text = _decode_bytes(f.read())
+        except FileNotFoundError:
+            parser.error(f"File not found: {args.file}")
     elif args.clipboard:
         text = get_clipboard_text() or ""
+        if not text:
+            empty_clipboard = True
     else:
         text = ""
 
-    TTSPlayer(text, args.voice, args.speed).run()
+    player = TTSPlayer(text, args.voice, args.speed)
+    if empty_clipboard:
+        player.status_var.set("Clipboard was empty")
+    player.run()
 
 
 if __name__ == "__main__":
