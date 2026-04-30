@@ -68,6 +68,7 @@ C = dict(
 
 _CbStop   = sd.CallbackStop
 _PREFS    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tts_prefs.json")
+_VOICES_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tts_voices.json")
 
 
 def _load_prefs() -> dict:
@@ -84,6 +85,29 @@ def _save_prefs(data: dict):
             json.dump(data, f)
     except OSError:
         pass
+
+
+def _load_voice_catalog() -> list[dict]:
+    """Return cached voice list, or empty if not yet fetched."""
+    try:
+        with open(_VOICES_CACHE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _fetch_and_cache_voices():
+    """Background thread: fetch full edge-tts voice list and persist to disk."""
+    try:
+        import edge_tts
+        loop = asyncio.new_event_loop()
+        voices = loop.run_until_complete(edge_tts.list_voices())
+        loop.close()
+        with open(_VOICES_CACHE, "w", encoding="utf-8") as f:
+            json.dump(voices, f)
+        return voices
+    except Exception:
+        return []
 
 
 # ── Quality monkey-patch ────────────────────────────────────────────────────
@@ -456,14 +480,16 @@ def get_clipboard_text() -> str:
     return _decode_bytes(result.stdout)
 
 
-def fetch_audio(text: str, voice: str, audio_format: str = _TTS_DEFAULT_FORMAT) -> str:
+def fetch_audio(text: str, voice: str, audio_format: str = _TTS_DEFAULT_FORMAT,
+                pitch_hz: int = 0) -> str:
     import edge_tts
     fd, path = tempfile.mkstemp(suffix=".mp3")
     os.close(fd)
     loop = asyncio.new_event_loop()
     try:
         async def _run():
-            comm = edge_tts.Communicate(text, voice, rate="+0%")
+            pitch_str = f"{pitch_hz:+d}Hz"
+            comm = edge_tts.Communicate(text, voice, rate="+0%", pitch=pitch_str)
             with open(path, "wb") as f:
                 async for chunk in comm.stream():
                     if chunk["type"] == "audio":
@@ -500,7 +526,11 @@ class TTSPlayer:
         self._tick_id    = None
         self._seek_lock  = False
         self._resume_sec = 0.0
-        self._last_speak_text = ""
+        self._last_speak_text  = ""
+        self._last_audio_bytes = None
+
+        # Kick off background voice catalog fetch
+        threading.Thread(target=self._load_catalog_async, daemon=True).start()
 
         # Restore last_text when no new text is provided
         if not initial_text and prefs.get("last_text"):
@@ -560,12 +590,15 @@ class TTSPlayer:
         tk.Label(bar, text="Voice:", bg=C["base"], fg=C["subtext"],
                  font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
         self.voice_var = tk.StringVar(value=VOICES[self.voice_idx][0])
+        self._all_voice_labels = [v[0] for v in VOICES]  # starts with favorites; extended by catalog
+        self._all_voice_ids    = [v[1] for v in VOICES]
         self.voice_cb = ttk.Combobox(bar, textvariable=self.voice_var,
-                                     values=[v[0] for v in VOICES],
-                                     state="readonly", width=22)
+                                     values=self._all_voice_labels,
+                                     width=26)
         self.voice_cb.pack(side="left")
         self.voice_cb.current(self.voice_idx)
         self.voice_cb.bind("<<ComboboxSelected>>", self._on_voice_changed)
+        self.voice_cb.bind("<KeyRelease>",          self._on_voice_filter)
         tk.Label(bar, text="Quality:", bg=C["base"], fg=C["subtext"],
                  font=("Segoe UI", 9)).pack(side="left", padx=(10, 4))
         self.quality_var = tk.StringVar(value=QUALITY_LABELS[self.quality_idx])
@@ -577,6 +610,16 @@ class TTSPlayer:
         self.quality_cb.bind("<<ComboboxSelected>>", self._on_quality_changed)
         tk.Label(bar, text="(↑quality = ↑CPU)", bg=C["base"], fg=C["muted"],
                  font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
+        tk.Label(bar, text="Pitch:", bg=C["base"], fg=C["subtext"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(10, 4))
+        self.pitch_var = tk.IntVar(value=0)
+        ttk.Scale(bar, from_=-50, to=50, orient="horizontal",
+                  variable=self.pitch_var, length=70,
+                  command=lambda _: None).pack(side="left")
+        self.pitch_lbl = tk.Label(bar, textvariable=tk.StringVar(), bg=C["base"],
+                                  fg=C["subtext"], font=("Segoe UI", 8), width=5)
+        self.pitch_lbl.pack(side="left")
+        self.pitch_var.trace_add("write", self._on_pitch_changed)
 
         # Row 2: Text area
         txt_frame = tk.Frame(main, bg=C["surface"])
@@ -611,6 +654,8 @@ class TTSPlayer:
         self.speak_btn = self._btn(btn_bar, "▶  Speak", self._speak,
                                    fg=C["base"], bg=C["accent"], active_bg=C["text"])
         self.speak_btn.pack(side="left")
+        self._btn(btn_bar, "💾 Save", self._save_audio,
+                  fg=C["subtext"]).pack(side="left", padx=(4, 0))
 
         # Row 4: Divider
         tk.Frame(main, bg=C["overlay"], height=1).grid(row=4, column=0, sticky="ew")
@@ -707,6 +752,9 @@ class TTSPlayer:
         if vol is not None:
             self.vol_var.set(vol)
             self.engine.set_volume(vol / 100)
+        pitch = self._prefs.get("pitch_hz")
+        if pitch is not None:
+            self.pitch_var.set(pitch)
 
     def _btn(self, parent, text, cmd, fg=None, bg=None,
              active_bg=None, font=("Segoe UI", 10), width=6):
@@ -723,10 +771,46 @@ class TTSPlayer:
         """Re-generate audio with the new voice, resuming from current position."""
         idx = self.voice_cb.current()
         if idx >= 0:
-            self.voice_idx = idx
+            self.voice_idx = min(idx, len(VOICES) - 1)  # only update builtin index for prefs
         if self.engine.duration > 0 and not self.loading:
             self._resume_sec = self.engine.position if self.engine.is_playing or self.engine.is_paused else 0.0
             self._speak()
+
+    # ── Voice catalog ─────────────────────────────────────────────────────────
+    def _load_catalog_async(self):
+        voices = _load_voice_catalog()
+        if not voices:
+            voices = _fetch_and_cache_voices()
+        if voices:
+            self.root.after(0, lambda: self._on_catalog_loaded(voices))
+
+    def _on_catalog_loaded(self, voices: list[dict]):
+        favorites = [v[0] for v in VOICES]
+        fav_ids   = [v[1] for v in VOICES]
+        extra_labels, extra_ids = [], []
+        seen = set(fav_ids)
+        for v in voices:
+            vid = v.get("ShortName", "")
+            if vid not in seen:
+                seen.add(vid)
+                name = v.get("FriendlyName", vid)
+                extra_labels.append(name)
+                extra_ids.append(vid)
+        self._all_voice_labels = favorites + extra_labels
+        self._all_voice_ids    = fav_ids + extra_ids
+        self.voice_cb["values"] = self._all_voice_labels
+
+    def _on_voice_filter(self, _=None):
+        typed = self.voice_var.get().lower()
+        if not typed:
+            self.voice_cb["values"] = self._all_voice_labels
+            return
+        filtered = [lbl for lbl in self._all_voice_labels if typed in lbl.lower()]
+        self.voice_cb["values"] = filtered if filtered else self._all_voice_labels
+
+    def _on_pitch_changed(self, *_):
+        v = self.pitch_var.get()
+        self.pitch_lbl.config(text=f"{v:+d}Hz")
 
     def _on_quality_changed(self, _=None):
         idx = self.quality_cb.current()
@@ -800,14 +884,24 @@ class TTSPlayer:
             self._retry_btn.pack_forget()
 
         idx = self.voice_cb.current()
-        voice_id = VOICES[idx][1] if idx >= 0 else VOICES[self.voice_idx][1]
+        if 0 <= idx < len(self._all_voice_ids):
+            voice_id = self._all_voice_ids[idx]
+        else:
+            # Free-typed name: search full catalog labels
+            typed = self.voice_var.get()
+            try:
+                match_idx = self._all_voice_labels.index(typed)
+                voice_id = self._all_voice_ids[match_idx]
+            except ValueError:
+                voice_id = VOICES[self.voice_idx][1]
         speed = SPEED_STEPS[self.speed_idx]
         audio_fmt, new_sr = QUALITY_PRESETS[self.quality_idx][1], QUALITY_PRESETS[self.quality_idx][2]
         self.engine.sr = new_sr  # update SR before WSOLA workers are spawned
+        pitch_hz = int(getattr(self, "pitch_var", None) and self.pitch_var.get() or 0)
 
         def _worker():
             try:
-                path = fetch_audio(text, voice_id, audio_fmt)
+                path = fetch_audio(text, voice_id, audio_fmt, pitch_hz)
                 if gen != self._fetch_gen:
                     try: os.unlink(path)
                     except OSError: pass
@@ -826,7 +920,10 @@ class TTSPlayer:
             return  # superseded by a newer request
         try:
             self.engine.load_file(path)
+            with open(path, "rb") as f:
+                self._last_audio_bytes = f.read()
         except Exception as exc:
+            self._last_audio_bytes = None
             self._on_error(str(exc))
             return
         finally:
@@ -881,6 +978,24 @@ class TTSPlayer:
         text = getattr(self, "_last_speak_text", None)
         if text:
             self._speak(text_override=text)
+
+    def _save_audio(self):
+        audio = getattr(self, "_last_audio_bytes", None)
+        if not audio:
+            self.status_var.set("No audio to save — speak something first")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".mp3",
+            filetypes=[("MP3 audio", "*.mp3"), ("All files", "*.*")],
+            title="Save audio",
+        )
+        if path:
+            try:
+                with open(path, "wb") as f:
+                    f.write(audio)
+                self.status_var.set(f"Saved → {os.path.basename(path)}")
+            except OSError as e:
+                self.status_var.set(f"Save failed: {e}")
 
     def _on_playback_done(self):
         self._cancel_tick()
@@ -1046,6 +1161,7 @@ class TTSPlayer:
             "speed_idx":   self.speed_idx,
             "voice_idx":   self.voice_idx,
             "quality_idx": self.quality_idx,
+            "pitch_hz":    self.pitch_var.get(),
             "geometry":    self.root.geometry(),
             "pin_on":      self.pin_on,
             "volume":      self.vol_var.get(),
