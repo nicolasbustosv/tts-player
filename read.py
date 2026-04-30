@@ -492,6 +492,7 @@ class TTSPlayer:
         self.voice_idx   = voice_idx if voice_idx is not None else prefs.get("voice_idx", DEFAULT_VOICE_IDX)
         self.speed_idx   = speed_idx if speed_idx is not None else prefs.get("speed_idx", DEFAULT_SPEED)
         self.quality_idx = prefs.get("quality_idx", DEFAULT_QUALITY_IDX)
+        self._prefs      = prefs
         _sr = QUALITY_PRESETS[self.quality_idx][2]
         self.engine      = AudioEngine(sample_rate=_sr)
         self.loading     = False
@@ -499,6 +500,11 @@ class TTSPlayer:
         self._tick_id    = None
         self._seek_lock  = False
         self._resume_sec = 0.0
+        self._last_speak_text = ""
+
+        # Restore last_text when no new text is provided
+        if not initial_text and prefs.get("last_text"):
+            initial_text = prefs["last_text"]
 
         self._build_gui(initial_text)
         self.engine.on_done = lambda: self.root.after(0, self._on_playback_done)
@@ -662,7 +668,8 @@ class TTSPlayer:
 
         # Row 9: Hints
         tk.Label(main,
-                 text="Space: play/pause   ←/→: ±10s   Ctrl+Enter: speak   Ctrl+Shift+V: paste & speak",
+                 text="Space: play/pause   ←/→: ±10s   Ctrl+Enter: speak   "
+                      "Ctrl+Shift+V: paste & speak   Ctrl+↑/↓: speed   [/]: volume",
                  bg=C["base"], fg=C["muted"], font=("Segoe UI", 8)
                  ).grid(row=9, column=0, sticky="w", pady=(4, 0))
 
@@ -675,10 +682,31 @@ class TTSPlayer:
         self.root.bind("<Control-Shift-V>",     lambda e: self._paste_and_speak())
         self.root.bind("<Control-Shift-KeyPress-V>", lambda e: self._paste_and_speak())
         self.root.bind("<Escape>",              lambda e: self._stop())
+        self.root.bind("<Control-Up>",          lambda e: self._faster() or "break")
+        self.root.bind("<Control-Down>",        lambda e: self._slower() or "break")
+        self.root.bind("<bracketleft>",         self._kb_vol_down)
+        self.root.bind("<bracketright>",        self._kb_vol_up)
         self.text_area.bind("<<Modified>>",     self._on_text_changed)
+        self.text_area.bind("<Button-3>",       self._show_context_menu)
 
         self._update_char_count()
         self._set_transport("disabled")
+
+        # Restore persisted prefs
+        geom = self._prefs.get("geometry")
+        if geom:
+            try:
+                self.root.geometry(geom)
+            except tk.TclError:
+                pass
+        if self._prefs.get("pin_on"):
+            self.pin_on = True
+            self.root.attributes("-topmost", True)
+            self.pin_btn.config(fg=C["accent"])
+        vol = self._prefs.get("volume")
+        if vol is not None:
+            self.vol_var.set(vol)
+            self.engine.set_volume(vol / 100)
 
     def _btn(self, parent, text, cmd, fg=None, bg=None,
              active_bg=None, font=("Segoe UI", 10), width=6):
@@ -725,7 +753,10 @@ class TTSPlayer:
 
     # ── Paste ─────────────────────────────────────────────────────────────────
     def _paste_clipboard(self):
-        text = get_clipboard_text()
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            text = ""
         if text:
             self.text_area.delete("1.0", "end")
             self.text_area.insert("1.0", text)
@@ -748,8 +779,8 @@ class TTSPlayer:
         self.pin_btn.config(fg=C["accent"] if self.pin_on else C["muted"])
 
     # ── Speak / load ──────────────────────────────────────────────────────────
-    def _speak(self):
-        text = self.text_area.get("1.0", "end-1c").strip()
+    def _speak(self, text_override: str | None = None):
+        text = text_override or self.text_area.get("1.0", "end-1c").strip()
         if not text:
             self.status_var.set("Nothing to speak")
             return
@@ -757,6 +788,7 @@ class TTSPlayer:
         # If already loading, cancel the in-flight request and restart
         self._fetch_gen += 1
         gen = self._fetch_gen
+        self._last_speak_text = text  # for retry
 
         self.engine.stop()
         self._cancel_tick()
@@ -764,6 +796,8 @@ class TTSPlayer:
         self._set_transport("disabled")
         self.play_btn.config(text="...")
         self.status_var.set("Generating audio ...")
+        if hasattr(self, "_retry_btn"):
+            self._retry_btn.pack_forget()
 
         idx = self.voice_cb.current()
         voice_id = VOICES[idx][1] if idx >= 0 else VOICES[self.voice_idx][1]
@@ -781,7 +815,7 @@ class TTSPlayer:
                 self.root.after(0, lambda: self._on_ready(path, speed, gen))
             except Exception as exc:
                 if gen == self._fetch_gen:
-                    self.root.after(0, lambda: self._on_error(str(exc)))
+                    self.root.after(0, lambda: self._on_error(exc))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -818,10 +852,35 @@ class TTSPlayer:
         self._sync_ui()
         self._start_tick()
 
-    def _on_error(self, msg: str):
+    def _on_error(self, exc: Exception | str):
         self.loading = False
         self.play_btn.config(text="▶")
+        msg = str(exc)
+        try:
+            import aiohttp
+            if isinstance(exc, (aiohttp.ClientConnectorError, OSError)):
+                msg = "No internet — edge-tts requires an online connection"
+        except ImportError:
+            pass
+        try:
+            import edge_tts.exceptions
+            if isinstance(exc, edge_tts.exceptions.NoAudioReceived):
+                msg = "Empty audio response — try a different voice or text"
+        except (ImportError, AttributeError):
+            pass
         self.status_var.set(f"Error: {msg}")
+        if not hasattr(self, "_retry_btn"):
+            self._retry_btn = self._btn(
+                self.root, "↻ Retry", self._retry, fg=C["yellow"], width=7,
+            )
+        self._retry_btn.place(relx=1.0, rely=0.0, anchor="ne", x=-8, y=8)
+
+    def _retry(self):
+        if hasattr(self, "_retry_btn"):
+            self._retry_btn.place_forget()
+        text = getattr(self, "_last_speak_text", None)
+        if text:
+            self._speak(text_override=text)
 
     def _on_playback_done(self):
         self._cancel_tick()
@@ -945,10 +1004,53 @@ class TTSPlayer:
             self._forward()
             return "break"
 
+    def _kb_vol_down(self, e):
+        if not self._in_text():
+            self.vol_var.set(max(0, self.vol_var.get() - 5))
+            self._on_volume()
+            return "break"
+
+    def _kb_vol_up(self, e):
+        if not self._in_text():
+            self.vol_var.set(min(100, self.vol_var.get() + 5))
+            self._on_volume()
+            return "break"
+
+    # ── Context menu ──────────────────────────────────────────────────────────
+    def _show_context_menu(self, event):
+        menu = tk.Menu(self.root, tearoff=0, bg=C["surface"], fg=C["text"],
+                       activebackground=C["accent"], activeforeground=C["base"])
+        menu.add_command(label="Cut",        command=lambda: self.text_area.event_generate("<<Cut>>"))
+        menu.add_command(label="Copy",       command=lambda: self.text_area.event_generate("<<Copy>>"))
+        menu.add_command(label="Paste",      command=lambda: self.text_area.event_generate("<<Paste>>"))
+        menu.add_command(label="Select All", command=lambda: self.text_area.tag_add("sel", "1.0", "end"))
+        menu.add_separator()
+        menu.add_command(label="Speak Selection", command=self._speak_selection)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _speak_selection(self):
+        try:
+            text = self.text_area.get("sel.first", "sel.last").strip()
+        except tk.TclError:
+            return
+        if text:
+            self._speak(text_override=text)
+
     # ── Close ─────────────────────────────────────────────────────────────────
     def _on_close(self):
-        _save_prefs({"speed_idx": self.speed_idx, "voice_idx": self.voice_idx,
-                     "quality_idx": self.quality_idx})
+        last_text = self.text_area.get("1.0", "end-1c")
+        _save_prefs({
+            "speed_idx":   self.speed_idx,
+            "voice_idx":   self.voice_idx,
+            "quality_idx": self.quality_idx,
+            "geometry":    self.root.geometry(),
+            "pin_on":      self.pin_on,
+            "volume":      self.vol_var.get(),
+            "last_text":   last_text[:50_000],
+        })
         self._cancel_tick()
         self.engine.on_done = None  # prevent callbacks on destroyed widget
         self.engine.stop()          # also increments _gen to cancel WSOLA threads
