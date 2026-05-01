@@ -388,6 +388,8 @@ class AudioEngine:
         target = max(0.0, min(sec, self.duration))
         was_playing = self.is_playing
         if was_playing:
+            with self._lock:
+                self._state = "idle"   # prevent _finished from firing on_done during seek
             self._close_stream()
         with self._lock:
             if self._active is not None and len(self._active) > 0:
@@ -395,7 +397,8 @@ class AudioEngine:
             else:
                 self._pos = 0
         if was_playing:
-            self._state = "playing"
+            with self._lock:
+                self._state = "playing"
             self._open_stream()
 
     def set_speed(self, speed: float, on_ready: callable = None):
@@ -1001,7 +1004,9 @@ class TTSPlayer:
         self._cancel_tick()
         self.play_btn.config(text="▶")
         self.status_var.set("Done")
+        self._seek_lock = True
         self.progress_var.set(100)
+        self._seek_lock = False
         d = self.engine.duration
         self.time_var.set(f"{_fmt(d)} / {_fmt(d)}")
 
